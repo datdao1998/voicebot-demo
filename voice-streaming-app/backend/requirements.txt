@@ -1,0 +1,7 @@
+FastAPI
+uvicorn
+pydub
+numpy
+speechrecognition
+gtts
+aiofiles
