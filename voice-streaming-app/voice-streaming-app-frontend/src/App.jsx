@@ -222,11 +222,19 @@ function App() {
       addLog('Already recording');
       return;
     }
-
+  
     if (!wsConnected) {
       addLog('❌ WebSocket not connected');
       setStatus('❌ Not connected - Wait for connection');
       return;
+    }
+  
+    // Send start signal to backend
+    if (websocketRef.current?.readyState === WebSocket.OPEN) {
+      addLog('📤 Sending start_recording signal to server...');
+      websocketRef.current.send(JSON.stringify({
+        action: 'start_recording'
+      }));
     }
   
     addLog('🎤 Requesting microphone...');
@@ -270,22 +278,29 @@ function App() {
             try {
               websocketRef.current.send(event.data);
               if (chunkCount % 10 === 0) {
-                addLog(`📦 Sent ${chunkCount} chunks`);
+                addLog(`📦 Sent ${chunkCount} chunks (${event.data.size} bytes)`);
               }
             } catch (err) {
               addLog(`❌ Send error: ${err.message}`);
             }
+          } else {
+            addLog(`⚠️ WebSocket not open (state: ${websocketRef.current?.readyState})`);
           }
         }
       };
   
       mediaRecorder.onstart = () => {
-        if (mountedRef.current) addLog('🔴 Recording started');
+        if (mountedRef.current) {
+          addLog('🔴 Recording started');
+          chunkCount = 0; // Reset counter
+        }
       };
       
       mediaRecorder.onstop = () => {
-        if (mountedRef.current) addLog('🛑 Recording stopped');
-        stream.getTracks().forEach(t => t.stop());
+        if (mountedRef.current) {
+          addLog(`🛑 Recording stopped (sent ${chunkCount} chunks total)`);
+          stream.getTracks().forEach(t => t.stop());
+        }
       };
       
       mediaRecorder.onerror = (e) => {
@@ -312,7 +327,7 @@ function App() {
       setStatus(`❌ ${userMessage}`);
     }
   };
-
+  
   const stopRecording = () => {
     addLog('📍 stopRecording() called');
     
@@ -320,23 +335,37 @@ function App() {
       addLog('Nothing to stop');
       return;
     }
-
-    // Stop MediaRecorder
-    addLog('Stopping MediaRecorder...');
-    mediaRecorderRef.current.stop();
-    mediaRecorderRef.current = null;
+  
+    const recorder = mediaRecorderRef.current;
     
+    // Check recorder state
+    addLog(`Recorder state: ${recorder.state}`);
+    
+    if (recorder.state === 'recording') {
+      // Stop MediaRecorder
+      addLog('Stopping MediaRecorder...');
+      recorder.stop();
+      
+      // Wait a bit for final chunks to be sent
+      setTimeout(() => {
+        if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+          addLog('📤 Sending stop_recording signal to server...');
+          websocketRef.current.send(JSON.stringify({
+            action: 'stop_recording'
+          }));
+        } else {
+          addLog('⚠️ Cannot send stop signal - WebSocket not open');
+        }
+      }, 300); // Give time for final chunks
+      
+    } else {
+      addLog(`⚠️ Recorder not in recording state: ${recorder.state}`);
+    }
+    
+    mediaRecorderRef.current = null;
     setIsRecording(false);
     setIsProcessing(true);
     setStatus('⏳ Processing... (transcribing & generating response)');
-    
-    // Send stop signal to backend
-    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
-      addLog('📤 Sending stop signal to server...');
-      websocketRef.current.send(JSON.stringify({
-        action: 'stop_recording'
-      }));
-    }
   };
 
   return (

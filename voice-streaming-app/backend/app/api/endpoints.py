@@ -5,30 +5,11 @@ from datetime import datetime
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydub import AudioSegment
 from io import BytesIO
+import speech_recognition as sr
+import base64
+import json
 
 router = APIRouter()
-
-import os
-import json
-from datetime import datetime
-from io import BytesIO
-from fastapi import WebSocket, WebSocketDisconnect
-from pydub import AudioSegment
-import speech_recognition as sr
-import base64
-# Install: pip install SpeechRecognition pydub gtts
-
-import os
-import json
-import asyncio
-from datetime import datetime
-from io import BytesIO
-from fastapi import WebSocket, WebSocketDisconnect
-from pydub import AudioSegment
-import speech_recognition as sr
-import base64
-
-# Install: pip install SpeechRecognition pydub gtts
 
 RECORDINGS_DIR = "recordings"
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
@@ -38,58 +19,93 @@ async def voice_stream(websocket: WebSocket):
     await websocket.accept()
     print("✅ Client connected")
     
-    audio_chunks = []
-    chunk_count = 0
-    
     try:
         while True:
-            # Wait for message from client
-            try:
-                message = await asyncio.wait_for(
-                    websocket.receive(),
-                    timeout=300.0  # 5 minute timeout
-                )
-            except asyncio.TimeoutError:
-                print("⏱️ Connection timeout")
-                break
+            # Reset for each recording session
+            audio_chunks = []
+            chunk_count = 0
+            recording_started = False
             
-            # Handle different message types
-            if "bytes" in message:
-                # Audio chunk received
-                data = message["bytes"]
-                audio_chunks.append(data)
-                chunk_count += 1
-                
-                if chunk_count % 20 == 0:
-                    print(f"📦 Received {chunk_count} chunks")
-                
-                # Echo back (optional - can remove this if you want)
+            print("\n🎤 Ready for new recording...")
+            
+            # Inner loop for each recording
+            recording_active = True
+            while recording_active:
                 try:
-                    await websocket.send_bytes(data)
-                except Exception as e:
-                    print(f"Echo failed: {e}")
+                    message = await asyncio.wait_for(
+                        websocket.receive(),
+                        timeout=300.0  # 5 minute timeout
+                    )
+                except asyncio.TimeoutError:
+                    print("⏱️ Connection timeout")
+                    return  # Exit completely on timeout
                 
-            elif "text" in message:
-                # Text message received
-                try:
-                    msg_data = json.loads(message["text"])
-                    action = msg_data.get("action")
+                # Handle different message types
+                if "bytes" in message:
+                    # Audio chunk received
+                    data = message["bytes"]
                     
-                    if action == "stop_recording":
-                        print(f"\n🛑 Stop signal received! Processing {chunk_count} chunks...")
-                        await process_and_respond(websocket, audio_chunks)
-                        break  # Exit after processing
-                    else:
-                        print(f"Unknown action: {action}")
+                    # Only accept audio chunks if we haven't processed yet
+                    if recording_active and not recording_started:
+                        recording_started = True
+                        print("🎙️ First audio chunk received, recording started")
+                    
+                    if recording_active:
+                        audio_chunks.append(data)
+                        chunk_count += 1
                         
-                except json.JSONDecodeError:
-                    print(f"Received non-JSON text: {message['text']}")
-            
-            else:
-                print(f"Unknown message type: {message}")
+                        if chunk_count % 20 == 0:
+                            print(f"📦 Received {chunk_count} chunks (total size: {sum(len(c) for c in audio_chunks)} bytes)")
+                        
+                        # Echo back (optional)
+                        try:
+                            await websocket.send_bytes(data)
+                        except Exception as e:
+                            print(f"Echo failed: {e}")
+                    
+                elif "text" in message:
+                    # Text message received
+                    try:
+                        msg_data = json.loads(message["text"])
+                        action = msg_data.get("action")
+                        
+                        if action == "stop_recording":
+                            print(f"\n🛑 Stop signal received!")
+                            print(f"   Total chunks: {chunk_count}")
+                            print(f"   Total bytes: {sum(len(c) for c in audio_chunks)}")
+                            
+                            if chunk_count > 0:
+                                await process_and_respond(websocket, audio_chunks)
+                            else:
+                                print("⚠️ No audio chunks received!")
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "message": "No audio data received"
+                                }))
+                            
+                            recording_active = False  # Exit inner loop, but keep WebSocket alive
+                            # Clear the list to free memory
+                            audio_chunks.clear()
+                            print("✅ Ready for next recording\n")
+                        
+                        elif action == "start_recording":
+                            print("▶️ Start recording signal received")
+                            # Reset state for new recording
+                            audio_chunks.clear()
+                            chunk_count = 0
+                            recording_started = False
+                            
+                        else:
+                            print(f"Unknown action: {action}")
+                            
+                    except json.JSONDecodeError:
+                        print(f"Received non-JSON text: {message['text']}")
+                
+                else:
+                    print(f"Unknown message type: {message}")
     
     except WebSocketDisconnect:
-        print("❌ Client disconnected unexpectedly")
+        print("❌ Client disconnected")
     except Exception as e:
         print(f"❌ Error in WebSocket handler: {e}")
         import traceback
@@ -135,9 +151,12 @@ async def process_and_respond(websocket: WebSocket, audio_chunks):
         
         # 3. Generate response audio
         print("🔊 Generating TTS response...")
-        response_text = f"You said: {transcript}. Thank you for your message!"
-        response_audio_path = generate_response_audio(response_text, timestamp)
-        
+
+        response_audio_path = "/Users/datdq98/Desktop/GITHUB/voicebot-demo/voice-streaming-app/backend/recordings/responses/response.wav"
+
+        # response_text = f"You said: {transcript}. Thank you for your message!"
+        # response_audio_path = generate_response_audio(response_text, timestamp)
+
         if response_audio_path and os.path.exists(response_audio_path):
             print(f"✅ Response audio created: {response_audio_path}")
             
@@ -213,14 +232,18 @@ def generate_response_audio(text, timestamp):
     try:
         from gtts import gTTS
         
+        print(f"🔊 Generating TTS for: '{text}'")
+        
         # Generate MP3 first
         mp3_path = output_path.replace('.wav', '.mp3')
         tts = gTTS(text=text, lang='en', slow=False)
         tts.save(mp3_path)
+        print(f"✅ MP3 saved: {mp3_path}")
         
         # Convert to WAV
         audio = AudioSegment.from_mp3(mp3_path)
         audio.export(output_path, format="wav")
+        print(f"✅ WAV saved: {output_path}")
         
         # Cleanup MP3
         if os.path.exists(mp3_path):
@@ -230,15 +253,16 @@ def generate_response_audio(text, timestamp):
         
     except ImportError:
         print("⚠️ gTTS not installed. Install with: pip install gtts")
-        return None
+        # Try offline alternative
+        return generate_response_audio_offline(text, timestamp)
     except Exception as e:
         print(f"TTS error: {e}")
         import traceback
         traceback.print_exc()
-        return None
+        # Try offline alternative
+        return generate_response_audio_offline(text, timestamp)
 
 
-# Alternative offline TTS (if gTTS doesn't work)
 def generate_response_audio_offline(text, timestamp):
     """Fallback: offline TTS using pyttsx3"""
     try:
@@ -248,12 +272,15 @@ def generate_response_audio_offline(text, timestamp):
         os.makedirs(response_dir, exist_ok=True)
         output_path = f"{response_dir}/response_{timestamp}.wav"
         
+        print(f"🔊 Using offline TTS for: '{text}'")
+        
         engine = pyttsx3.init()
         engine.setProperty('rate', 150)
         engine.setProperty('volume', 0.9)
         engine.save_to_file(text, output_path)
         engine.runAndWait()
         
+        print(f"✅ Offline TTS saved: {output_path}")
         return output_path
     except Exception as e:
         print(f"Offline TTS error: {e}")
