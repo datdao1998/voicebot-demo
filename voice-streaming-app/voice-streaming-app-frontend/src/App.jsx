@@ -7,14 +7,16 @@ function App() {
   const [wsConnected, setWsConnected] = useState(false);
   const [debugLog, setDebugLog] = useState([]);
   const [clickCount, setClickCount] = useState(0);
-  const [savedRecordings, setSavedRecordings] = useState([]);
+  const [transcript, setTranscript] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [recordings, setRecordings] = useState([]);
   
   const mediaRecorderRef = useRef(null);
   const websocketRef = useRef(null);
   const streamRef = useRef(null);
   const mountedRef = useRef(true);
   const reconnectTimerRef = useRef(null);
-  const shouldReconnectRef = useRef(true); // Control auto-reconnect
+  const shouldReconnectRef = useRef(true);
 
   const addLog = useCallback((message) => {
     const logMessage = `${new Date().toLocaleTimeString()}: ${message}`;
@@ -36,83 +38,147 @@ function App() {
   }, [addLog]);
 
   const connectWebSocket = useCallback(() => {
-    let ws = null;
-  
     if (!mountedRef.current) return;
 
     addLog('🔄 Creating WebSocket connection...');
     
     try {
-      ws = new WebSocket('ws://localhost:8000/ws');
+      const ws = new WebSocket('ws://localhost:8000/ws');
+      
+      ws.onopen = () => {
+        if (!mountedRef.current) return;
+        addLog('✅ WebSocket CONNECTED');
+        setStatus('Connected – Ready to record');
+        setWsConnected(true);
+      };
+
+      ws.onmessage = (event) => {
+        if (!mountedRef.current) return;
+        
+        // Check if it's JSON or binary
+        if (typeof event.data === 'string') {
+          try {
+            const message = JSON.parse(event.data);
+            handleServerMessage(message);
+          } catch (e) {
+            addLog(`Received text: ${event.data}`);
+          }
+        } else {
+          // Binary data (echo during recording)
+          addLog(`📨 Received ${event.data.size} bytes`);
+        }
+      };
+
+      ws.onerror = () => {
+        if (!mountedRef.current) return;
+        addLog('❌ WebSocket ERROR');
+        setStatus('Connection error');
+        setWsConnected(false);
+      };
+
+      ws.onclose = (event) => {
+        if (!mountedRef.current) return;
+        addLog(`🔌 WebSocket CLOSED (code: ${event.code})`);
+        setWsConnected(false);
+        websocketRef.current = null;
+        
+        if (shouldReconnectRef.current && event.code !== 1000) {
+          setStatus('Disconnected – Retrying in 3s...');
+          reconnectTimerRef.current = setTimeout(() => {
+            if (mountedRef.current && shouldReconnectRef.current) {
+              connectWebSocket();
+            }
+          }, 3000);
+        }
+      };
+
+      websocketRef.current = ws;
+      
     } catch (err) {
       addLog(`❌ Failed to create WebSocket: ${err.message}`);
-      if (mountedRef.current) {
-        setStatus('WebSocket creation failed');
-        setWsConnected(false);
-      }
-      return;
+      setStatus('WebSocket creation failed');
+      setWsConnected(false);
     }
-
-    ws.onopen = () => {
-      if (!mountedRef.current) return;
-      addLog('✅ WebSocket CONNECTED');
-      setStatus('Connected – Ready to stream');
-      setWsConnected(true);
-    };
-
-    ws.onmessage = (event) => {
-      if (!mountedRef.current) return;
-      addLog(`📨 Received ${event.data.size} bytes`);
-      const audioBlob = new Blob([event.data], { type: 'audio/webm' });
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audio = new Audio(audioUrl);
-      audio.play().catch(e => addLog(`Audio error: ${e.message}`));
-    };
-
-    ws.onerror = () => {
-      if (!mountedRef.current) return;
-      addLog('❌ WebSocket ERROR');
-      setStatus('Connection error');
-      setWsConnected(false);
-    };
-
-    ws.onclose = (event) => {
-      if (!mountedRef.current) return;
-      addLog(`🔌 WebSocket CLOSED (code: ${event.code})`);
-      
-      // Check if this was a manual close (for saving) or an error
-      if (event.code === 1000) {
-        // Normal closure - recording was saved
-        addLog('💾 Backend is saving your recording as WAV...');
-        setStatus('✅ Recording saved on server!');
-        
-        const timestamp = new Date().toLocaleTimeString();
-        setSavedRecordings(prev => [...prev, `Recording at ${timestamp}`]);
-      } else {
-        setStatus('Disconnected – Retrying in 3s...');
-      }
-      
-      setWsConnected(false);
-      websocketRef.current = null;
-      
-      // Only auto-reconnect if we should (not during manual stop)
-      if (shouldReconnectRef.current && event.code !== 1000) {
-        reconnectTimerRef.current = setTimeout(() => {
-          if (mountedRef.current && shouldReconnectRef.current) {
-            connectWebSocket();
-          }
-        }, 3000);
-      }
-    };
-
-    websocketRef.current = ws;
   }, [addLog]);
+
+  const handleServerMessage = (message) => {
+    addLog(`📩 Server message: ${message.type}`);
+    
+    switch (message.type) {
+      case 'transcript':
+        addLog(`📝 Transcript: ${message.text}`);
+        setTranscript(message.text);
+        setStatus('✅ Transcript received! Playing response...');
+        break;
+        
+      case 'audio':
+        addLog('🔊 Response audio received');
+        playResponseAudio(message.data, message.format);
+        break;
+        
+      case 'complete':
+        addLog('✅ Processing complete');
+        setIsProcessing(false);
+        setStatus('🎉 Recording complete! Ready for next recording.');
+        
+        // Add to recordings list
+        const timestamp = new Date().toLocaleTimeString();
+        setRecordings(prev => [...prev, {
+          time: timestamp,
+          transcript: transcript
+        }]);
+        
+        // Clear transcript after a delay
+        setTimeout(() => {
+          if (mountedRef.current) {
+            setTranscript('');
+          }
+        }, 10000);
+        break;
+        
+      case 'error':
+        addLog(`❌ Server error: ${message.message}`);
+        setStatus(`Error: ${message.message}`);
+        setIsProcessing(false);
+        break;
+        
+      default:
+        addLog(`Unknown message type: ${message.type}`);
+    }
+  };
+
+  const playResponseAudio = (base64Data, format) => {
+    try {
+      // Decode base64 to binary
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      
+      // Create blob and play
+      const blob = new Blob([bytes], { type: `audio/${format}` });
+      const audioUrl = URL.createObjectURL(blob);
+      const audio = new Audio(audioUrl);
+      
+      audio.onplay = () => addLog('▶️ Playing response audio...');
+      audio.onended = () => {
+        addLog('✅ Audio playback complete');
+        URL.revokeObjectURL(audioUrl);
+      };
+      audio.onerror = (e) => addLog(`Audio play error: ${e}`);
+      
+      audio.play();
+      
+    } catch (e) {
+      addLog(`Error playing audio: ${e.message}`);
+    }
+  };
 
   useEffect(() => {
     connectWebSocket();
 
     return () => {
-      addLog('Cleaning up WebSocket...');
       shouldReconnectRef.current = false;
       
       if (reconnectTimerRef.current) {
@@ -136,11 +202,9 @@ function App() {
   }, [connectWebSocket]);
 
   const handleButtonClick = () => {
-    console.log('MAIN BUTTON CLICKED!');
     const newCount = clickCount + 1;
     setClickCount(newCount);
-    addLog(`🖱️ MAIN clicked (${newCount})`);
-    addLog(`State: recording=${isRecording}, ws=${wsConnected}`);
+    addLog(`🖱️ Button clicked (${newCount})`);
     
     if (isRecording) {
       addLog('→ Stopping...');
@@ -155,25 +219,17 @@ function App() {
     addLog('📍 startRecording() called');
     
     if (isRecording) {
-      addLog('Already recording - exit');
+      addLog('Already recording');
       return;
     }
 
-    // Ensure WebSocket is connected
     if (!wsConnected) {
-      addLog('❌ WebSocket not connected - attempting to connect...');
-      connectWebSocket();
-      
-      // Wait a moment for connection
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      if (!wsConnected) {
-        setStatus('❌ Cannot connect to server');
-        return;
-      }
+      addLog('❌ WebSocket not connected');
+      setStatus('❌ Not connected - Wait for connection');
+      return;
     }
   
-    addLog('Requesting microphone...');
+    addLog('🎤 Requesting microphone...');
     setStatus('Requesting microphone...');
   
     try {
@@ -190,7 +246,7 @@ function App() {
         return;
       }
       
-      addLog(`✅ Microphone granted! Tracks: ${stream.getAudioTracks().length}`);
+      addLog(`✅ Microphone access granted`);
       streamRef.current = stream;
   
       const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
@@ -209,17 +265,16 @@ function App() {
         
         if (event.data.size > 0) {
           chunkCount++;
-          addLog(`📦 Chunk ${chunkCount}: ${event.data.size}b`);
           
           if (websocketRef.current?.readyState === WebSocket.OPEN) {
             try {
               websocketRef.current.send(event.data);
-              addLog(`✅ Sent chunk ${chunkCount}`);
+              if (chunkCount % 10 === 0) {
+                addLog(`📦 Sent ${chunkCount} chunks`);
+              }
             } catch (err) {
               addLog(`❌ Send error: ${err.message}`);
             }
-          } else {
-            addLog(`❌ WS not open (state: ${websocketRef.current?.readyState})`);
           }
         }
       };
@@ -237,12 +292,12 @@ function App() {
         if (mountedRef.current) addLog(`❌ Recorder error: ${e.error}`);
       };
   
-      mediaRecorder.start(250); // 250ms chunks
-      addLog('MediaRecorder.start() called (250ms chunks)');
+      mediaRecorder.start(250);
+      addLog('Recording started (250ms chunks)');
   
       setIsRecording(true);
       setStatus('🔴 RECORDING - Speak now!');
-      addLog('✅ Recording and streaming to server');
+      setTranscript('');
   
     } catch (err) {
       addLog(`❌ ${err.name}: ${err.message}`);
@@ -266,31 +321,22 @@ function App() {
       return;
     }
 
-    // Stop the MediaRecorder
+    // Stop MediaRecorder
     addLog('Stopping MediaRecorder...');
     mediaRecorderRef.current.stop();
     mediaRecorderRef.current = null;
     
-    // Close WebSocket to trigger backend save
-    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
-      addLog('🔌 Closing WebSocket to save recording...');
-      shouldReconnectRef.current = false; // Prevent auto-reconnect
-      websocketRef.current.close(1000, 'Recording complete'); // Normal closure
-      addLog('✅ WebSocket closed - backend will save WAV file');
-    }
-    
     setIsRecording(false);
-    setStatus('⏳ Saving recording...');
-    addLog('Recording session ended');
+    setIsProcessing(true);
+    setStatus('⏳ Processing... (transcribing & generating response)');
     
-    // Re-enable auto-reconnect after a delay and reconnect
-    setTimeout(() => {
-      shouldReconnectRef.current = true;
-      if (mountedRef.current) {
-        addLog('Reconnecting WebSocket for next session...');
-        connectWebSocket();
-      }
-    }, 2000);
+    // Send stop signal to backend
+    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+      addLog('📤 Sending stop signal to server...');
+      websocketRef.current.send(JSON.stringify({
+        action: 'stop_recording'
+      }));
+    }
   };
 
   return (
@@ -298,13 +344,14 @@ function App() {
       textAlign: 'center', 
       padding: '30px', 
       fontFamily: 'Arial',
-      maxWidth: '900px',
+      maxWidth: '1000px',
       margin: '0 auto',
       backgroundColor: '#fafafa',
       minHeight: '100vh'
     }}>
-      <h1>🎙️ Voice Recording & Streaming</h1>
+      <h1>🎙️ Voice Recording with Transcription</h1>
       
+      {/* Status Cards */}
       <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', marginBottom: '20px', flexWrap: 'wrap' }}>
         <div style={{ 
           padding: '10px 20px',
@@ -317,12 +364,12 @@ function App() {
         </div>
         <div style={{ 
           padding: '10px 20px',
-          backgroundColor: isRecording ? '#ff9800' : '#9e9e9e',
+          backgroundColor: isRecording ? '#ff9800' : isProcessing ? '#2196f3' : '#9e9e9e',
           color: 'white',
           borderRadius: '8px',
           fontWeight: 'bold'
         }}>
-          Recording: {isRecording ? '🔴 ON' : '⚪ OFF'}
+          {isRecording ? '🔴 Recording' : isProcessing ? '⏳ Processing' : '⚪ Ready'}
         </div>
       </div>
 
@@ -330,54 +377,83 @@ function App() {
         {status}
       </p>
 
-      {/* Saved recordings list */}
-      {savedRecordings.length > 0 && (
+      {/* Transcript Display */}
+      {transcript && (
         <div style={{
           marginBottom: '20px',
-          padding: '15px',
-          backgroundColor: '#e8f5e9',
+          padding: '20px',
+          backgroundColor: '#e3f2fd',
           borderRadius: '8px',
-          border: '2px solid #4caf50'
+          border: '2px solid #2196f3'
         }}>
-          <strong>💾 Saved Recordings ({savedRecordings.length}):</strong>
-          <div style={{ marginTop: '10px', fontSize: '14px' }}>
-            {savedRecordings.map((recording, i) => (
-              <div key={i} style={{ padding: '5px 0' }}>
-                ✅ {recording}
+          <strong style={{ fontSize: '18px' }}>📝 Transcript:</strong>
+          <p style={{ 
+            marginTop: '10px', 
+            fontSize: '16px',
+            fontStyle: 'italic',
+            color: '#333'
+          }}>
+            "{transcript}"
+          </p>
+        </div>
+      )}
+
+      {/* Record Button */}
+      <div style={{ marginBottom: '30px' }}>
+        <button
+          onClick={handleButtonClick}
+          disabled={(!wsConnected && !isRecording) || isProcessing}
+          style={{
+            padding: '20px 40px',
+            fontSize: '18px',
+            backgroundColor: isRecording ? '#ff4444' : isProcessing ? '#cccccc' : wsConnected ? '#44ff44' : '#cccccc',
+            color: 'white',
+            border: 'none',
+            borderRadius: '50px',
+            cursor: (wsConnected || isRecording) && !isProcessing ? 'pointer' : 'not-allowed',
+            opacity: (wsConnected || isRecording) && !isProcessing ? 1 : 0.6,
+            fontWeight: 'bold',
+            transition: 'all 0.2s',
+            boxShadow: (isRecording || wsConnected) && !isProcessing ? '0 4px 6px rgba(0,0,0,0.1)' : 'none'
+          }}
+        >
+          {isRecording ? '⏹️ STOP & TRANSCRIBE' : isProcessing ? '⏳ PROCESSING...' : '🎙️ START RECORDING'}
+        </button>
+      </div>
+
+      {/* Previous Recordings */}
+      {recordings.length > 0 && (
+        <div style={{
+          marginBottom: '20px',
+          padding: '20px',
+          backgroundColor: 'white',
+          borderRadius: '8px',
+          boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+          textAlign: 'left'
+        }}>
+          <strong style={{ fontSize: '16px' }}>📚 Recording History ({recordings.length}):</strong>
+          <div style={{ marginTop: '15px' }}>
+            {recordings.slice().reverse().map((rec, i) => (
+              <div key={i} style={{ 
+                padding: '12px',
+                marginBottom: '10px',
+                backgroundColor: '#f5f5f5',
+                borderRadius: '6px',
+                borderLeft: '4px solid #4caf50'
+              }}>
+                <div style={{ fontSize: '12px', color: '#666', marginBottom: '5px' }}>
+                  {rec.time}
+                </div>
+                <div style={{ fontSize: '14px', fontStyle: 'italic' }}>
+                  "{rec.transcript}"
+                </div>
               </div>
             ))}
-          </div>
-          <div style={{ marginTop: '10px', fontSize: '12px', color: '#666' }}>
-            Check your backend <code>recordings/</code> folder for WAV files
           </div>
         </div>
       )}
 
-      <div style={{ marginBottom: '30px' }}>
-        <button
-          onClick={handleButtonClick}
-          disabled={!wsConnected && !isRecording}
-          style={{
-            padding: '20px 40px',
-            fontSize: '18px',
-            backgroundColor: isRecording ? '#ff4444' : wsConnected ? '#44ff44' : '#cccccc',
-            color: 'white',
-            border: 'none',
-            borderRadius: '50px',
-            cursor: wsConnected || isRecording ? 'pointer' : 'not-allowed',
-            opacity: wsConnected || isRecording ? 1 : 0.6,
-            fontWeight: 'bold',
-            transition: 'all 0.2s',
-            boxShadow: isRecording || wsConnected ? '0 4px 6px rgba(0,0,0,0.1)' : 'none'
-          }}
-        >
-          {isRecording ? '⏹️ STOP & SAVE RECORDING' : '🎙️ START RECORDING'}
-        </button>
-        <div style={{ marginTop: '10px', fontSize: '14px', color: '#666' }}>
-          Button clicks: {clickCount}
-        </div>
-      </div>
-
+      {/* Debug Log */}
       <div style={{ 
         padding: '20px',
         backgroundColor: 'white',
@@ -385,12 +461,12 @@ function App() {
         textAlign: 'left',
         boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
       }}>
-        <strong style={{ fontSize: '16px' }}>🔍 Debug Log (last 10):</strong>
+        <strong style={{ fontSize: '16px' }}>🔍 Debug Log:</strong>
         <div style={{ 
           fontFamily: 'Consolas, monospace', 
           fontSize: '12px',
           marginTop: '10px',
-          maxHeight: '300px',
+          maxHeight: '200px',
           overflow: 'auto',
           backgroundColor: '#f5f5f5',
           padding: '15px',
@@ -411,6 +487,7 @@ function App() {
         </div>
       </div>
 
+      {/* Instructions */}
       <div style={{ 
         marginTop: '20px', 
         padding: '15px',
@@ -421,17 +498,20 @@ function App() {
       }}>
         <strong>📋 How it works:</strong>
         <ol style={{ margin: '10px 0', paddingLeft: '20px' }}>
-          <li><strong>Click "START RECORDING"</strong> - Connects to server and starts streaming audio</li>
-          <li><strong>Speak into microphone</strong> - Audio chunks sent every 250ms</li>
-          <li><strong>Click "STOP & SAVE"</strong> - Closes connection and triggers backend to:
+          <li><strong>Click "START RECORDING"</strong> - Begin recording your voice</li>
+          <li><strong>Speak clearly</strong> - Audio is streamed to server in real-time</li>
+          <li><strong>Click "STOP & TRANSCRIBE"</strong> - Server will:
             <ul style={{ marginTop: '5px', fontSize: '12px' }}>
-              <li>Combine all audio chunks</li>
-              <li>Convert WebM to WAV format</li>
-              <li>Save to <code>recordings/recording_YYYYMMDD_HHMMSS.wav</code></li>
+              <li>Save your recording as WAV file</li>
+              <li>Transcribe speech to text using Google Speech Recognition</li>
+              <li>Generate an audio response using text-to-speech</li>
+              <li>Send transcript and play the response audio</li>
             </ul>
           </li>
-          <li>WebSocket automatically reconnects for next recording</li>
         </ol>
+        <div style={{ marginTop: '10px', padding: '8px', backgroundColor: '#fff', borderRadius: '4px', fontSize: '12px' }}>
+          <strong>💡 Note:</strong> Requires internet connection for speech recognition and text-to-speech services.
+        </div>
       </div>
     </div>
   );
