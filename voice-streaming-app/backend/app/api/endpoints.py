@@ -17,101 +17,106 @@ os.makedirs(RECORDINGS_DIR, exist_ok=True)
 @router.websocket("/ws")
 async def voice_stream(websocket: WebSocket):
     await websocket.accept()
-    print("✅ Client connected")
+    print("✅ Client connected\n")
     
     try:
-        while True:
-            # Reset for each recording session
+        while True:  # Keep connection alive for multiple recordings
+            # Reset state for each new recording session
             audio_chunks = []
             chunk_count = 0
-            recording_started = False
+            is_recording = False
             
-            print("\n🎤 Ready for new recording...")
+            print("🎧 Waiting for recording to start...")
             
-            # Inner loop for each recording
-            recording_active = True
-            while recording_active:
+            # Inner loop for a single recording session
+            while True:
                 try:
                     message = await asyncio.wait_for(
                         websocket.receive(),
                         timeout=300.0  # 5 minute timeout
                     )
-                except asyncio.TimeoutError:
-                    print("⏱️ Connection timeout")
-                    return  # Exit completely on timeout
-                
-                # Handle different message types
-                if "bytes" in message:
-                    # Audio chunk received
-                    data = message["bytes"]
                     
-                    # Only accept audio chunks if we haven't processed yet
-                    if recording_active and not recording_started:
-                        recording_started = True
-                        print("🎙️ First audio chunk received, recording started")
+                    # Check if connection is closing
+                    if message.get("type") == "websocket.disconnect":
+                        print("🔌 Client initiated disconnect")
+                        return  # Exit completely
                     
-                    if recording_active:
-                        audio_chunks.append(data)
-                        chunk_count += 1
+                    # Handle binary data (audio chunks)
+                    if "bytes" in message:
+                        data = message["bytes"]
                         
-                        if chunk_count % 20 == 0:
-                            print(f"📦 Received {chunk_count} chunks (total size: {sum(len(c) for c in audio_chunks)} bytes)")
+                        # Only collect chunks if we're actively recording
+                        if is_recording or chunk_count == 0:
+                            audio_chunks.append(data)
+                            chunk_count += 1
+                            is_recording = True
+                            
+                            if chunk_count == 1:
+                                print(f"🎤 Recording started (first chunk received)")
+                            elif chunk_count % 20 == 0:
+                                print(f"📦 Received {chunk_count} chunks (total: {sum(len(c) for c in audio_chunks)} bytes)")
                         
                         # Echo back (optional)
                         try:
                             await websocket.send_bytes(data)
-                        except Exception as e:
-                            print(f"Echo failed: {e}")
+                        except Exception:
+                            pass
                     
-                elif "text" in message:
-                    # Text message received
-                    try:
-                        msg_data = json.loads(message["text"])
-                        action = msg_data.get("action")
-                        
-                        if action == "stop_recording":
-                            print(f"\n🛑 Stop signal received!")
-                            print(f"   Total chunks: {chunk_count}")
-                            print(f"   Total bytes: {sum(len(c) for c in audio_chunks)}")
+                    # Handle text messages
+                    elif "text" in message:
+                        try:
+                            msg_data = json.loads(message["text"])
+                            action = msg_data.get("action")
                             
-                            if chunk_count > 0:
-                                await process_and_respond(websocket, audio_chunks)
-                            else:
-                                print("⚠️ No audio chunks received!")
-                                await websocket.send_text(json.dumps({
-                                    "type": "error",
-                                    "message": "No audio data received"
-                                }))
-                            
-                            recording_active = False  # Exit inner loop, but keep WebSocket alive
-                            # Clear the list to free memory
-                            audio_chunks.clear()
-                            print("✅ Ready for next recording\n")
-                        
-                        elif action == "start_recording":
-                            print("▶️ Start recording signal received")
-                            # Reset state for new recording
-                            audio_chunks.clear()
-                            chunk_count = 0
-                            recording_started = False
-                            
-                        else:
-                            print(f"Unknown action: {action}")
-                            
-                    except json.JSONDecodeError:
-                        print(f"Received non-JSON text: {message['text']}")
+                            if action == "stop_recording":
+                                print(f"\n🛑 Stop recording signal received!")
+                                print(f"   Total chunks collected: {chunk_count}")
+                                print(f"   Total bytes: {sum(len(c) for c in audio_chunks)}")
+                                
+                                if chunk_count > 0:
+                                    # Process this recording
+                                    await process_and_respond(websocket, audio_chunks)
+                                    print("✅ Processing complete - ready for next recording\n")
+                                else:
+                                    print("⚠️ No audio chunks received!")
+                                    await websocket.send_text(json.dumps({
+                                        "type": "error",
+                                        "message": "No audio data received"
+                                    }))
+                                
+                                # Break inner loop to reset for next recording
+                                break
+                                
+                        except json.JSONDecodeError:
+                            print(f"⚠️ Invalid JSON: {message['text']}")
                 
-                else:
-                    print(f"Unknown message type: {message}")
+                except asyncio.TimeoutError:
+                    print("⏱️ Connection timeout")
+                    return  # Exit completely
+                    
+                except WebSocketDisconnect:
+                    print("❌ Client disconnected")
+                    return  # Exit completely
+                    
+                except RuntimeError as e:
+                    if "disconnect" in str(e).lower():
+                        print("❌ Disconnect detected")
+                        return  # Exit completely
+                    else:
+                        raise
     
     except WebSocketDisconnect:
-        print("❌ Client disconnected")
+        print("❌ WebSocket disconnected unexpectedly")
     except Exception as e:
         print(f"❌ Error in WebSocket handler: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        print("🔌 WebSocket connection closing\n")
+        print("🔌 WebSocket connection closed\n")
+        try:
+            await websocket.close()
+        except:
+            pass
 
 
 async def process_and_respond(websocket: WebSocket, audio_chunks):
@@ -128,56 +133,102 @@ async def process_and_respond(websocket: WebSocket, audio_chunks):
         # 1. Combine and save audio
         print("📁 Combining audio chunks...")
         full_webm_bytes = b"".join(audio_chunks)
-        audio = AudioSegment.from_file(BytesIO(full_webm_bytes), format="webm")
+        print(f"   Combined size: {len(full_webm_bytes)} bytes")
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        wav_filename = f"{RECORDINGS_DIR}/recording_{timestamp}.wav"
         
-        audio.export(wav_filename, format="wav")
-        print(f"✅ Saved: {wav_filename}")
-        print(f"   Duration: {len(audio)/1000:.2f}s")
+        # Save raw WebM first
+        webm_filename = f"{RECORDINGS_DIR}/recording_{timestamp}.webm"
+        with open(webm_filename, "wb") as f:
+            f.write(full_webm_bytes)
+        print(f"✅ Raw WebM saved: {webm_filename}")
+        
+        # Convert to WAV
+        wav_filename = f"{RECORDINGS_DIR}/recording_{timestamp}.wav"
+        try:
+            # Verify the WebM file is valid
+            file_size = os.path.getsize(webm_filename)
+            print(f"   WebM file size: {file_size} bytes")
+            
+            if file_size < 1000:
+                print(f"⚠️ WebM file too small ({file_size} bytes), might be corrupted")
+            
+            # Try loading from file (more reliable than BytesIO)
+            print("   Attempting AudioSegment.from_file...")
+            audio = AudioSegment.from_file(webm_filename, format="webm")
+            print(f"   ✅ AudioSegment loaded: {len(audio)}ms, {audio.frame_rate}Hz")
+            
+            audio.export(wav_filename, format="wav")
+            print(f"✅ WAV converted: {wav_filename}")
+            print(f"   Duration: {len(audio)/1000:.2f}s")
+            file_to_transcribe = wav_filename
+            
+        except Exception as conv_err:
+            print(f"⚠️ WebM conversion failed: {type(conv_err).__name__}: {conv_err}")
+            print("   Trying alternative methods...")
+            
+            # Try with different parameters
+            try:
+                print("   Attempt 2: Using codec='opus'...")
+                audio = AudioSegment.from_file(webm_filename, codec="opus")
+                audio.export(wav_filename, format="wav")
+                print(f"✅ WAV converted (opus): {wav_filename}")
+                file_to_transcribe = wav_filename
+                
+            except Exception as e2:
+                print(f"⚠️ Opus conversion failed: {type(e2).__name__}: {e2}")
+                
+                try:
+                    print("   Attempt 3: Using BytesIO with raw bytes...")
+                    audio = AudioSegment.from_file(BytesIO(full_webm_bytes), format="webm")
+                    audio.export(wav_filename, format="wav")
+                    print(f"✅ WAV converted (BytesIO): {wav_filename}")
+                    file_to_transcribe = wav_filename
+                    
+                except Exception as e3:
+                    print(f"⚠️ BytesIO conversion failed: {type(e3).__name__}: {e3}")
+                    print("   All conversion methods failed - using WebM directly")
+                    file_to_transcribe = webm_filename
         
         # 2. Transcribe
         print("🎯 Transcribing audio...")
-        transcript = transcribe_audio(wav_filename)
+        transcript = transcribe_audio(file_to_transcribe)
         print(f"📝 Transcript: '{transcript}'")
         
-        # Send transcript to client
+        # Send transcript
         await websocket.send_text(json.dumps({
             "type": "transcript",
             "text": transcript
         }))
-        print("✅ Transcript sent to client")
+        print("✅ Transcript sent")
+        
+        await asyncio.sleep(0.1)
         
         # 3. Generate response audio
         print("🔊 Generating TTS response...")
-
-        response_audio_path = "/Users/datdq98/Desktop/GITHUB/voicebot-demo/voice-streaming-app/backend/recordings/responses/response.wav"
-
-        # response_text = f"You said: {transcript}. Thank you for your message!"
-        # response_audio_path = generate_response_audio(response_text, timestamp)
-
+        response_text = f"You said: {transcript}. Thank you for your message!"
+        response_audio_path = generate_response_audio(response_text, timestamp)
+        
         if response_audio_path and os.path.exists(response_audio_path):
-            print(f"✅ Response audio created: {response_audio_path}")
+            print(f"✅ Response audio: {response_audio_path}")
             
-            # Read and encode audio
             with open(response_audio_path, "rb") as f:
                 audio_bytes = f.read()
             
             audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
-            print(f"📤 Sending response audio ({len(audio_bytes)} bytes)")
             
-            # Send audio to client
             await websocket.send_text(json.dumps({
                 "type": "audio",
                 "data": audio_base64,
                 "format": "wav"
             }))
-            print("✅ Audio sent to client")
+            print("✅ Audio sent")
         else:
             print("⚠️ Failed to generate response audio")
         
-        # 4. Send completion signal
+        await asyncio.sleep(0.1)
+        
+        # 4. Send completion
         await websocket.send_text(json.dumps({
             "type": "complete",
             "message": "Processing complete"
@@ -198,28 +249,50 @@ async def process_and_respond(websocket: WebSocket, audio_chunks):
             pass
 
 
-def transcribe_audio(wav_file_path):
+def transcribe_audio(audio_file_path):
     """Transcribe audio using Google Speech Recognition"""
     recognizer = sr.Recognizer()
     
     try:
-        with sr.AudioFile(wav_file_path) as source:
-            # Adjust for ambient noise
+        # Convert to WAV if needed
+        if not audio_file_path.endswith('.wav'):
+            print(f"   Converting {audio_file_path} to WAV...")
+            try:
+                audio = AudioSegment.from_file(audio_file_path)
+                wav_temp = audio_file_path.replace('.webm', '_temp.wav')
+                audio.export(wav_temp, format="wav")
+                audio_file_path = wav_temp
+                print(f"   Temp WAV: {wav_temp}")
+            except Exception as e:
+                print(f"   Conversion failed: {e}")
+                return "Audio format conversion failed"
+        
+        with sr.AudioFile(audio_file_path) as source:
             recognizer.adjust_for_ambient_noise(source, duration=0.5)
             audio_data = recognizer.record(source)
             
             # Use Google Speech Recognition
             text = recognizer.recognize_google(audio_data)
+            
+            # Clean up temp file
+            if '_temp.wav' in audio_file_path:
+                try:
+                    os.remove(audio_file_path)
+                except:
+                    pass
+            
             return text
             
     except sr.UnknownValueError:
         return "Could not understand audio"
     except sr.RequestError as e:
-        print(f"Speech recognition error: {e}")
-        return f"Recognition service error"
+        print(f"Recognition error: {e}")
+        return "Recognition service error"
     except Exception as e:
         print(f"Transcription error: {e}")
-        return f"Transcription failed"
+        import traceback
+        traceback.print_exc()
+        return "Transcription failed"
 
 
 def generate_response_audio(text, timestamp):
@@ -232,35 +305,27 @@ def generate_response_audio(text, timestamp):
     try:
         from gtts import gTTS
         
-        print(f"🔊 Generating TTS for: '{text}'")
-        
-        # Generate MP3 first
+        # Generate MP3
         mp3_path = output_path.replace('.wav', '.mp3')
         tts = gTTS(text=text, lang='en', slow=False)
         tts.save(mp3_path)
-        print(f"✅ MP3 saved: {mp3_path}")
         
         # Convert to WAV
         audio = AudioSegment.from_mp3(mp3_path)
         audio.export(output_path, format="wav")
-        print(f"✅ WAV saved: {output_path}")
         
-        # Cleanup MP3
+        # Cleanup
         if os.path.exists(mp3_path):
             os.remove(mp3_path)
         
         return output_path
         
     except ImportError:
-        print("⚠️ gTTS not installed. Install with: pip install gtts")
-        # Try offline alternative
+        print("⚠️ gTTS not installed")
         return generate_response_audio_offline(text, timestamp)
     except Exception as e:
         print(f"TTS error: {e}")
-        import traceback
-        traceback.print_exc()
-        # Try offline alternative
-        return generate_response_audio_offline(text, timestamp)
+        return None
 
 
 def generate_response_audio_offline(text, timestamp):
@@ -272,15 +337,12 @@ def generate_response_audio_offline(text, timestamp):
         os.makedirs(response_dir, exist_ok=True)
         output_path = f"{response_dir}/response_{timestamp}.wav"
         
-        print(f"🔊 Using offline TTS for: '{text}'")
-        
         engine = pyttsx3.init()
         engine.setProperty('rate', 150)
         engine.setProperty('volume', 0.9)
         engine.save_to_file(text, output_path)
         engine.runAndWait()
         
-        print(f"✅ Offline TTS saved: {output_path}")
         return output_path
     except Exception as e:
         print(f"Offline TTS error: {e}")

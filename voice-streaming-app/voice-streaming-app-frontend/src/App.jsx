@@ -10,6 +10,7 @@ function App() {
   const [transcript, setTranscript] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [recordings, setRecordings] = useState([]);
+  const [responseAudio, setResponseAudio] = useState(null);
   
   const mediaRecorderRef = useRef(null);
   const websocketRef = useRef(null);
@@ -48,6 +49,7 @@ function App() {
       ws.onopen = () => {
         if (!mountedRef.current) return;
         addLog('✅ WebSocket CONNECTED');
+        console.log('WebSocket state:', ws.readyState);
         setStatus('Connected – Ready to record');
         setWsConnected(true);
       };
@@ -78,7 +80,8 @@ function App() {
 
       ws.onclose = (event) => {
         if (!mountedRef.current) return;
-        addLog(`🔌 WebSocket CLOSED (code: ${event.code})`);
+        addLog(`🔌 WebSocket CLOSED (code: ${event.code}, reason: ${event.reason})`);
+        console.log('Close event:', event);
         setWsConnected(false);
         websocketRef.current = null;
         
@@ -108,12 +111,14 @@ function App() {
       case 'transcript':
         addLog(`📝 Transcript: ${message.text}`);
         setTranscript(message.text);
-        setStatus('✅ Transcript received! Playing response...');
+        setStatus('✅ Transcript received! Waiting for response...');
         break;
         
       case 'audio':
         addLog('🔊 Response audio received');
+        setResponseAudio(message.data);
         playResponseAudio(message.data, message.format);
+        setStatus('▶️ Playing response audio...');
         break;
         
       case 'complete':
@@ -121,17 +126,39 @@ function App() {
         setIsProcessing(false);
         setStatus('🎉 Recording complete! Ready for next recording.');
         
-        // Add to recordings list
+        // Add to recordings list - use current state values directly
         const timestamp = new Date().toLocaleTimeString();
-        setRecordings(prev => [...prev, {
-          time: timestamp,
-          transcript: transcript
-        }]);
         
-        // Clear transcript after a delay
+        // Use setTimeout to ensure state is updated
+        setTimeout(() => {
+          setTranscript(currentTranscript => {
+            setResponseAudio(currentAudio => {
+              if (currentTranscript && currentAudio) {
+                setRecordings(prev => {
+                  // Check if this exact transcript already exists to avoid duplicates
+                  const exists = prev.some(r => r.transcript === currentTranscript && r.time === timestamp);
+                  if (!exists) {
+                    addLog(`Added to history: "${currentTranscript}"`);
+                    return [...prev, {
+                      time: timestamp,
+                      transcript: currentTranscript,
+                      response: currentAudio
+                    }];
+                  }
+                  return prev;
+                });
+              }
+              return currentAudio;
+            });
+            return currentTranscript;
+          });
+        }, 100);
+        
+        // Clear after a delay
         setTimeout(() => {
           if (mountedRef.current) {
             setTranscript('');
+            setResponseAudio(null);
           }
         }, 10000);
         break;
@@ -149,6 +176,8 @@ function App() {
 
   const playResponseAudio = (base64Data, format) => {
     try {
+      addLog('🎵 Decoding audio data...');
+      
       // Decode base64 to binary
       const binaryString = atob(base64Data);
       const bytes = new Uint8Array(binaryString.length);
@@ -156,22 +185,37 @@ function App() {
         bytes[i] = binaryString.charCodeAt(i);
       }
       
+      addLog(`✅ Decoded ${bytes.length} bytes`);
+      
       // Create blob and play
       const blob = new Blob([bytes], { type: `audio/${format}` });
       const audioUrl = URL.createObjectURL(blob);
       const audio = new Audio(audioUrl);
       
-      audio.onplay = () => addLog('▶️ Playing response audio...');
+      audio.onplay = () => {
+        addLog('▶️ Playing response audio...');
+        setStatus('▶️ Playing response...');
+      };
+      
       audio.onended = () => {
         addLog('✅ Audio playback complete');
+        setStatus('✅ Playback complete!');
         URL.revokeObjectURL(audioUrl);
       };
-      audio.onerror = (e) => addLog(`Audio play error: ${e}`);
       
-      audio.play();
+      audio.onerror = (e) => {
+        addLog(`❌ Audio play error: ${e.type}`);
+        console.error('Audio error:', e);
+      };
+      
+      audio.play().catch(err => {
+        addLog(`❌ Play failed: ${err.message}`);
+        console.error('Play error:', err);
+      });
       
     } catch (e) {
-      addLog(`Error playing audio: ${e.message}`);
+      addLog(`❌ Error playing audio: ${e.message}`);
+      console.error('Playback error:', e);
     }
   };
 
@@ -222,19 +266,11 @@ function App() {
       addLog('Already recording');
       return;
     }
-  
+
     if (!wsConnected) {
       addLog('❌ WebSocket not connected');
       setStatus('❌ Not connected - Wait for connection');
       return;
-    }
-  
-    // Send start signal to backend
-    if (websocketRef.current?.readyState === WebSocket.OPEN) {
-      addLog('📤 Sending start_recording signal to server...');
-      websocketRef.current.send(JSON.stringify({
-        action: 'start_recording'
-      }));
     }
   
     addLog('🎤 Requesting microphone...');
@@ -278,29 +314,22 @@ function App() {
             try {
               websocketRef.current.send(event.data);
               if (chunkCount % 10 === 0) {
-                addLog(`📦 Sent ${chunkCount} chunks (${event.data.size} bytes)`);
+                addLog(`📦 Sent ${chunkCount} chunks`);
               }
             } catch (err) {
               addLog(`❌ Send error: ${err.message}`);
             }
-          } else {
-            addLog(`⚠️ WebSocket not open (state: ${websocketRef.current?.readyState})`);
           }
         }
       };
   
       mediaRecorder.onstart = () => {
-        if (mountedRef.current) {
-          addLog('🔴 Recording started');
-          chunkCount = 0; // Reset counter
-        }
+        if (mountedRef.current) addLog('🔴 Recording started');
       };
       
       mediaRecorder.onstop = () => {
-        if (mountedRef.current) {
-          addLog(`🛑 Recording stopped (sent ${chunkCount} chunks total)`);
-          stream.getTracks().forEach(t => t.stop());
-        }
+        if (mountedRef.current) addLog('🛑 Recording stopped');
+        stream.getTracks().forEach(t => t.stop());
       };
       
       mediaRecorder.onerror = (e) => {
@@ -327,7 +356,7 @@ function App() {
       setStatus(`❌ ${userMessage}`);
     }
   };
-  
+
   const stopRecording = () => {
     addLog('📍 stopRecording() called');
     
@@ -335,34 +364,31 @@ function App() {
       addLog('Nothing to stop');
       return;
     }
-  
+
+    // Stop MediaRecorder
+    addLog('Stopping MediaRecorder...');
     const recorder = mediaRecorderRef.current;
     
-    // Check recorder state
-    addLog(`Recorder state: ${recorder.state}`);
-    
-    if (recorder.state === 'recording') {
-      // Stop MediaRecorder
-      addLog('Stopping MediaRecorder...');
-      recorder.stop();
+    // Use stop event to ensure all chunks are sent
+    recorder.addEventListener('stop', () => {
+      addLog('MediaRecorder stopped event fired');
       
-      // Wait a bit for final chunks to be sent
+      // Wait a bit for final chunks to be sent, then send stop signal
       setTimeout(() => {
         if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
-          addLog('📤 Sending stop_recording signal to server...');
+          addLog('📤 Sending stop signal to server...');
           websocketRef.current.send(JSON.stringify({
             action: 'stop_recording'
           }));
         } else {
           addLog('⚠️ Cannot send stop signal - WebSocket not open');
         }
-      }, 300); // Give time for final chunks
-      
-    } else {
-      addLog(`⚠️ Recorder not in recording state: ${recorder.state}`);
-    }
+      }, 500); // Increased to 500ms to ensure all chunks are sent
+    }, { once: true });
     
+    recorder.stop();
     mediaRecorderRef.current = null;
+    
     setIsRecording(false);
     setIsProcessing(true);
     setStatus('⏳ Processing... (transcribing & generating response)');
@@ -450,7 +476,7 @@ function App() {
         </button>
       </div>
 
-      {/* Previous Recordings */}
+      {/* Conversation History */}
       {recordings.length > 0 && (
         <div style={{
           marginBottom: '20px',
@@ -460,22 +486,64 @@ function App() {
           boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
           textAlign: 'left'
         }}>
-          <strong style={{ fontSize: '16px' }}>📚 Recording History ({recordings.length}):</strong>
+          <strong style={{ fontSize: '16px' }}>💬 Conversation History ({recordings.length}):</strong>
           <div style={{ marginTop: '15px' }}>
             {recordings.slice().reverse().map((rec, i) => (
               <div key={i} style={{ 
-                padding: '12px',
-                marginBottom: '10px',
+                padding: '15px',
+                marginBottom: '15px',
                 backgroundColor: '#f5f5f5',
-                borderRadius: '6px',
+                borderRadius: '8px',
                 borderLeft: '4px solid #4caf50'
               }}>
-                <div style={{ fontSize: '12px', color: '#666', marginBottom: '5px' }}>
-                  {rec.time}
+                <div style={{ fontSize: '12px', color: '#666', marginBottom: '10px' }}>
+                  🕐 {rec.time}
                 </div>
-                <div style={{ fontSize: '14px', fontStyle: 'italic' }}>
-                  "{rec.transcript}"
+                
+                {/* User message */}
+                <div style={{ 
+                  marginBottom: '10px',
+                  padding: '10px',
+                  backgroundColor: '#e3f2fd',
+                  borderRadius: '6px'
+                }}>
+                  <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#1976d2', marginBottom: '5px' }}>
+                    👤 You:
+                  </div>
+                  <div style={{ fontSize: '14px', fontStyle: 'italic' }}>
+                    "{rec.transcript}"
+                  </div>
                 </div>
+                
+                {/* AI Response */}
+                {rec.response && (
+                  <div style={{ 
+                    padding: '10px',
+                    backgroundColor: '#e8f5e9',
+                    borderRadius: '6px'
+                  }}>
+                    <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#388e3c', marginBottom: '5px' }}>
+                      🤖 AI Response:
+                    </div>
+                    <button
+                      onClick={() => playResponseAudio(rec.response, 'wav')}
+                      style={{
+                        padding: '8px 16px',
+                        fontSize: '13px',
+                        backgroundColor: '#4caf50',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '4px',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '5px'
+                      }}
+                    >
+                      ▶️ Play Response Audio
+                    </button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
